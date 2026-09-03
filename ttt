@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Load migration files, mark already-run scripts, then execute the rest in version order."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import TypedDict
+
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+
+from code import (
+    MigrationValidationError,
+    collect_migration_files,
+    ensure_migration_folder_exists,
+    extract_version_number,
+    read_file_text,
+)
+from const import (
+    MIGRATION_FOLDER,
+    SNOWFLAKE_ACCOUNT,
+    SNOWFLAKE_AUTH_METHOD,
+    SNOWFLAKE_DATABASE,
+    SNOWFLAKE_HISTORY_QUERY,
+    SNOWFLAKE_PASSPHRASE,
+    SNOWFLAKE_PASSWORD,
+    SNOWFLAKE_PRIVATE_KEY_PATH,
+    SNOWFLAKE_ROLE,
+    SNOWFLAKE_SCHEMA,
+    SNOWFLAKE_USERNAME,
+    SNOWFLAKE_WAREHOUSE,
+)
+
+
+class MigrationRow(TypedDict):
+    file_name: str
+    version_number: int | None
+    already_ran: bool
+    ordered_no: int | None
+    file_path: str
+
+
+class MigrationRunError(Exception):
+    """Raised when a migration cannot be loaded or executed."""
+
+
+def load_migration_rows(migration_folder: Path) -> list[MigrationRow]:
+    """Read all files in the migration folder into a list of row dicts."""
+    ensure_migration_folder_exists(migration_folder)
+    files = collect_migration_files(migration_folder)
+
+    rows: list[MigrationRow] = []
+    for file_path in files:
+        rows.append(
+            {
+                "file_name": file_path.name,
+                "version_number": extract_version_number(file_path.name),
+                "already_ran": False,
+                "ordered_no": None,
+                "file_path": str(file_path),
+            }
+        )
+    return rows
+
+
+def connect_snowflake():
+    """Open a Snowflake connection using env-backed settings from const.py."""
+    import snowflake.connector
+
+    if not SNOWFLAKE_ACCOUNT or not SNOWFLAKE_USERNAME:
+        raise MigrationRunError(
+            "Set SNOWFLAKE_ACCOUNT and SNOWFLAKE_USERNAME to connect."
+        )
+
+    common = {
+        "account": SNOWFLAKE_ACCOUNT,
+        "user": SNOWFLAKE_USERNAME,
+        "warehouse": SNOWFLAKE_WAREHOUSE,
+        "database": SNOWFLAKE_DATABASE,
+        "schema": SNOWFLAKE_SCHEMA,
+        "role": SNOWFLAKE_ROLE,
+    }
+
+    if SNOWFLAKE_AUTH_METHOD == "private_key":
+        if not SNOWFLAKE_PRIVATE_KEY_PATH:
+            raise MigrationRunError("Set SNOWFLAKE_PRIVATE_KEY_PATH for private_key auth.")
+        key_path = Path(SNOWFLAKE_PRIVATE_KEY_PATH).expanduser()
+        if not key_path.is_file():
+            raise MigrationRunError(f"Private key not found: {key_path}")
+        passphrase = SNOWFLAKE_PASSPHRASE.encode() if SNOWFLAKE_PASSPHRASE else None
+        with key_path.open("rb") as key_file:
+            private_key = serialization.load_pem_private_key(
+                key_file.read(),
+                password=passphrase,
+                backend=default_backend(),
+            )
+        der_key = private_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        return snowflake.connector.connect(**common, private_key=der_key)
+
+    if not SNOWFLAKE_PASSWORD:
+        raise MigrationRunError("Set SNOWFLAKE_PASSWORD for password auth.")
+    return snowflake.connector.connect(**common, password=SNOWFLAKE_PASSWORD)
+
+
+def _normalize_cell(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def fetch_ran_migrations(connection) -> tuple[set[str], set[int]]:
+    """Query Snowflake for scripts that already ran. Returns (file names, version numbers)."""
+    cursor = connection.cursor()
+    try:
+        cursor.execute(SNOWFLAKE_HISTORY_QUERY)
+        columns = [column[0].upper() for column in cursor.description]
+        rows = cursor.fetchall()
+    finally:
+        cursor.close()
+
+    file_names: set[str] = set()
+    version_numbers: set[int] = set()
+
+    script_indexes = [
+        index
+        for index, name in enumerate(columns)
+        if name in {"SCRIPT", "FILENAME", "FILE_NAME", "FILE NAME"}
+    ]
+    version_indexes = [
+        index for index, name in enumerate(columns) if name in {"VERSION", "VERSION_NUMBER"}
+    ]
+    success_indexes = [index for index, name in enumerate(columns) if name == "SUCCESS"]
+
+    for row in rows:
+        if success_indexes:
+            success = row[success_indexes[0]]
+            if success is False or str(success).upper() in {"FALSE", "0", "N"}:
+                continue
+
+        for index in script_indexes:
+            name = _normalize_cell(row[index])
+            if name:
+                file_names.add(Path(name).name)
+
+        for index in version_indexes:
+            raw = _normalize_cell(row[index])
+            if not raw:
+                continue
+            digits = "".join(character for character in raw if character.isdigit())
+            if digits:
+                version_numbers.add(int(digits))
+
+    return file_names, version_numbers
+
+
+def update_already_ran_flag(rows: list[MigrationRow], connection) -> list[MigrationRow]:
+    """Get Snowflake results and update the already_ran flag."""
+    ran_files, ran_versions = fetch_ran_migrations(connection)
+    updated: list[MigrationRow] = []
+    for row in rows:
+        version = row["version_number"]
+        already_ran = row["file_name"] in ran_files or (
+            version is not None and version in ran_versions
+        )
+        updated.append({**row, "already_ran": already_ran})
+    return updated
+
+
+def order_rows_by_version(rows: list[MigrationRow]) -> list[MigrationRow]:
+    """Sort by version_number ASC and populate ordered_no."""
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            row["version_number"] is None,
+            row["version_number"] if row["version_number"] is not None else 0,
+            row["file_name"],
+        ),
+    )
+    result: list[MigrationRow] = []
+    for index, row in enumerate(ordered, start=1):
+        result.append({**row, "ordered_no": index})
+    return result
+
+
+def print_migration_table(rows: list[MigrationRow]) -> None:
+    headers = ("File name", "Version number", "Already ran", "ordered no")
+    print(f"{headers[0]:<30} {headers[1]:>14} {headers[2]:>11} {headers[3]:>10}")
+    for row in rows:
+        version = "" if row["version_number"] is None else str(row["version_number"])
+        print(
+            f"{row['file_name']:<30} {version:>14} {str(row['already_ran']):>11} "
+            f"{str(row['ordered_no']):>10}"
+        )
+
+
+def execute_sql_file(connection, file_path: Path) -> None:
+    sql = read_file_text(file_path)
+    if not sql.strip():
+        print(f"Skipping empty file: {file_path.name}")
+        return
+
+    cursor = connection.cursor()
+    try:
+        cursor.execute("ALTER SESSION SET MULTI_STATEMENT_COUNT = 0")
+        cursor.execute(sql)
+    finally:
+        cursor.close()
+
+
+def execute_pending_migrations(rows: list[MigrationRow], connection) -> None:
+    """Loop ordered rows and execute scripts that have not already run."""
+    for row in rows:
+        file_name = row["file_name"]
+        ordered_no = row["ordered_no"]
+        file_path = Path(row["file_path"])
+
+        if row["already_ran"]:
+            print(f"[{ordered_no}] Already ran, skipping {file_name}")
+            continue
+
+        print(f"[{ordered_no}] Executing {file_name}")
+        try:
+            execute_sql_file(connection, file_path)
+        except Exception as exc:
+            raise MigrationRunError(f"Failed executing {file_name}: {exc}") from exc
+        print(f"[{ordered_no}] Completed {file_name}")
+
+
+def main() -> int:
+    migration_folder = Path(MIGRATION_FOLDER).resolve()
+
+    try:
+        rows = load_migration_rows(migration_folder)
+        if not rows:
+            print("No migration files found.")
+            return 0
+
+        connection = connect_snowflake()
+        try:
+            rows = update_already_ran_flag(rows, connection)
+            rows = order_rows_by_version(rows)
+            print_migration_table(rows)
+            execute_pending_migrations(rows, connection)
+        finally:
+            connection.close()
+    except (MigrationValidationError, MigrationRunError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print("Migration run finished.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
