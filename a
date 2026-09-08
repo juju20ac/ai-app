@@ -1,0 +1,36 @@
+def validate_clone_statement_targets(files: list[Path]) -> list[str]:
+    """
+    If a SQL file contains CLONE statements, require source and destination
+    to be qualified as schema.table (or database.schema.table).
+    """
+    issues: list[str] = []
+    for file_path in files:
+        try:
+            content = read_file_text(file_path)
+        except OSError as exc:
+            issues.append(f"{file_path.name}: could not read file ({exc})")
+            continue
+
+        clones = find_clone_statements(content)
+        if not clones:
+            continue
+
+        for destination, source in clones:
+            destination_ok = is_schema_table(destination)
+            source_ok = is_schema_table(source)
+            if destination_ok and source_ok:
+                continue
+
+            problems: list[str] = []
+            if not destination_ok:
+                problems.append(
+                    f"destination '{normalize_sql_identifier(destination)}' "
+                    "is not schema.table"
+                )
+            if not source_ok:
+                problems.append(
+                    f"source '{normalize_sql_identifier(source)}' "
+                    "is not schema.table"
+                )
+            issues.append(f"{file_path.name}: {'; '.join(problems)}")
+    return issues
