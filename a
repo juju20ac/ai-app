@@ -1,3 +1,13 @@
+# Unquoted ident, quoted "ident", or <<ENVIRONMENT>> tokens used in migrations.
+SQL_IDENTIFIER = (
+    r'(?:"[^"]+"|<<ENVIRONMENT>>(?:_[A-Za-z_][\w$]*)?|[A-Za-z_][\w$]*)'
+)
+# schema.table or database.schema.table
+SCHEMA_TABLE_PATTERN = re.compile(
+    rf"^{SQL_IDENTIFIER}(?:\s*\.\s*{SQL_IDENTIFIER}){{1,2}}$",
+    re.IGNORECASE,
+)
+
 CLONE_STATEMENT_PATTERN = re.compile(
     rf"""
     CREATE\s+
