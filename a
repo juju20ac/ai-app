@@ -21,6 +21,68 @@ CLONE_STATEMENT_PATTERN = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+def canonicalize_sql_name(identifier: str) -> str:
+    """Normalize a qualified name for equality checks (unquoted parts case-insensitive)."""
+    normalized = normalize_sql_identifier(identifier)
+    parts = re.findall(r'"[^"]+"|[^."]+', normalized)
+    return ".".join(
+        part if part.startswith('"') and part.endswith('"') else part.upper()
+        for part in parts
+    )
+def schema_tables_are_same(destination: str, source: str) -> bool:
+    """Return True when destination and source resolve to the same schema.table."""
+    return canonicalize_sql_name(destination) == canonicalize_sql_name(source)
+
+
+
+
+def validate_clone_statement_targets(files: list[Path]) -> list[str]:
+    """
+    If a SQL file contains CLONE statements, require source and destination
+    to be qualified as schema.table (or database.schema.table), and to match.
+    """
+    issues: list[str] = []
+    for file_path in files:
+        try:
+            content = read_file_text(file_path)
+        except OSError as exc:
+            issues.append(f"{file_path.name}: could not read file ({exc})")
+            continue
+
+        clones = find_clone_statements(content)
+        if not clones:
+            continue
+
+        for destination, source in clones:
+            destination_name = normalize_sql_identifier(destination)
+            source_name = normalize_sql_identifier(source)
+            destination_ok = is_schema_table(destination)
+            source_ok = is_schema_table(source)
+
+            problems: list[str] = []
+            if not destination_ok:
+                problems.append(f"destination '{destination_name}' is not schema.table")
+            if not source_ok:
+                problems.append(f"source '{source_name}' is not schema.table")
+            if (
+                destination_ok
+                and source_ok
+                and not schema_tables_are_same(destination, source)
+            ):
+                problems.append(
+                    f"source '{source_name}' and destination '{destination_name}' "
+                    "do not match"
+                )
+
+            if problems:
+                issues.append(f"{file_path.name}: {'; '.join(problems)}")
+    return issues
+
+
+
+
+
+
 
 
 def strip_sql_comments(sql: str) -> str:
