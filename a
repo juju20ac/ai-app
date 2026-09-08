@@ -1,36 +1,34 @@
-def validate_clone_statement_targets(files: list[Path]) -> list[str]:
-    """
-    If a SQL file contains CLONE statements, require source and destination
-    to be qualified as schema.table (or database.schema.table).
-    """
-    issues: list[str] = []
-    for file_path in files:
-        try:
-            content = read_file_text(file_path)
-        except OSError as exc:
-            issues.append(f"{file_path.name}: could not read file ({exc})")
-            continue
+CLONE_STATEMENT_PATTERN = re.compile(
+    rf"""
+    CREATE\s+
+    (?:OR\s+REPLACE\s+)?
+    (?:TEMP(?:ORARY)?\s+|TRANSIENT\s+)?
+    TABLE\s+
+    (?:IF\s+NOT\s+EXISTS\s+)?
+    (?P<destination>{SQL_IDENTIFIER}(?:\s*\.\s*{SQL_IDENTIFIER})*)
+    \s+CLONE\s+
+    (?P<source>{SQL_IDENTIFIER}(?:\s*\.\s*{SQL_IDENTIFIER})*)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
-        clones = find_clone_statements(content)
-        if not clones:
-            continue
 
-        for destination, source in clones:
-            destination_ok = is_schema_table(destination)
-            source_ok = is_schema_table(source)
-            if destination_ok and source_ok:
-                continue
+def strip_sql_comments(sql: str) -> str:
+    """Remove -- line comments and /* */ block comments before scanning SQL."""
+    without_blocks = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    return re.sub(r"--.*?$", " ", without_blocks, flags=re.MULTILINE)
 
-            problems: list[str] = []
-            if not destination_ok:
-                problems.append(
-                    f"destination '{normalize_sql_identifier(destination)}' "
-                    "is not schema.table"
-                )
-            if not source_ok:
-                problems.append(
-                    f"source '{normalize_sql_identifier(source)}' "
-                    "is not schema.table"
-                )
-            issues.append(f"{file_path.name}: {'; '.join(problems)}")
-    return issues
+def find_clone_statements(sql: str) -> list[tuple[str, str]]:
+    """Return (destination, source) pairs for each CREATE TABLE ... CLONE ... statement."""
+    cleaned = strip_sql_comments(sql)
+    return [
+        (match.group("destination"), match.group("source"))
+        for match in CLONE_STATEMENT_PATTERN.finditer(cleaned)
+    ]
+
+def is_schema_table(identifier: str) -> bool:
+    """Return True when identifier is schema.table or database.schema.table."""
+    return bool(SCHEMA_TABLE_PATTERN.match(normalize_sql_identifier(identifier)))
+
+def normalize_sql_identifier(identifier: str) -> str:
+    return re.sub(r"\s+", "", identifier.strip())
