@@ -1,0 +1,47 @@
+version: 2
+
+sources:
+  - name: dqrs_target
+    database: EDW_PROD_DB
+    schema: CUSTOMER
+    tables:
+      - name: customer_master
+        identifier: CUSTOMER_MASTER
+        data_tests:
+          - dqrs_accuracy:
+              name: acc_001_customer_dob_v1
+              arguments:
+                truth_relation: "{{ source('dqrs_truth', 'customer_ref_v2') }}"
+                rule_id: ACC-001
+                rule_version_id: ACC-001-V1
+                source_version_id: SRC-001-V2
+                key_mappings:
+                  - target: CUSTOMER_ID
+                    truth: CUSTOMER_ID
+                target_column: DATE_OF_BIRTH
+                truth_column: BIRTH_DATE
+                comparison_type: exact
+                normalization: none
+                null_policy: mismatch
+                tolerance: 0
+                tolerance_unit: days
+                scope_filter: "1 = 1"
+                min_accuracy_pct: 95
+                min_coverage_pct: 90
+              config:
+                severity: error
+                store_failures: true
+                tags: [dqrs, accuracy, daily]
+                meta:
+                  dqrs_severity: high
+                  schedule_id: DAILY_AFTER_UPSTREAM
+                  owner_role: CUSTOMER_DATA_STEWARD
+  - name: dqrs_truth
+    database: DATA_QUALITY_PROD_DB
+    schema: ACCURACY_REFERENCE
+    tables:
+      - name: customer_ref_v2
+        identifier: CUSTOMER_REF_V2
+        columns:
+          - name: CUSTOMER_ID
+            data_tests: [not_null, unique]
